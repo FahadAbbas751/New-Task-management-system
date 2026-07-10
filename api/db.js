@@ -188,7 +188,7 @@ function route(db, req) {
         team: p.team, assignedTo: p.assignedTo, assignedBy: user.id,
         startDate: p.startDate || '', dueDate: p.dueDate, estimatedHours: p.estimatedHours || '',
         project: p.project || '', category: p.category || 'Other',
-        attachments: JSON.stringify(p.attachments || []), status: 'Pending', notes: p.notes || '',
+        attachments: JSON.stringify(p.attachments || []), status: 'Pending', forwardedTo: '', notes: p.notes || '',
         checklist: JSON.stringify(p.checklist || []), tags: JSON.stringify(p.tags || []),
         createdISO: now(), updatedISO: now(), submittedISO: '', completedISO: ''
       };
@@ -240,6 +240,21 @@ function route(db, req) {
       return { ok: true, data: task };
     }
 
+    case 'forwardTask': {
+      const task = db.tasks.find(t => t.id === p.id);
+      if (!task) return err('Task not found');
+      if (!canManage(user, task)) return err('Not allowed');
+      const member = db.users.find(u => u.id === p.memberId && u.active && u.team === task.team);
+      if (!member) return err('Member not found in this team');
+      task.forwardedTo = task.forwardedTo || task.assignedTo; // remember original assignee (head)
+      task.assignedTo = p.memberId;
+      task.status = 'Pending';
+      task.updatedISO = now();
+      log(db, task.id, user.id, 'forwarded', user.name + ' → ' + member.name);
+      notify(db, p.memberId, 'assigned', task.id, user.name + ' assigned you: ' + task.title);
+      return { ok: true, data: task };
+    }
+
     case 'submitTask': {
       const task = db.tasks.find(t => t.id === p.id);
       if (!task) return err('Task not found');
@@ -257,7 +272,8 @@ function route(db, req) {
     case 'reviewTask': {
       const task = db.tasks.find(t => t.id === p.id);
       if (!task) return err('Task not found');
-      if (!canManage(user, task)) return err('Only team heads or admin can review');
+      const isOriginalHead = task.forwardedTo && task.forwardedTo === user.id;
+      if (!canManage(user, task) && !isOriginalHead) return err('Only team heads or admin can review');
       if (p.decision === 'approve') {
         task.status = 'Completed';
         task.completedISO = now();
