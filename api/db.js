@@ -181,7 +181,6 @@ function route(db, req) {
     /* ---- tasks ---- */
     case 'createTask': {
       if (user.role === 'member') return err('Members cannot create tasks');
-      if (user.role === 'head' && p.team !== user.team) return err('Heads can only assign within their team');
       if (!p.title || !p.assignedTo || !p.dueDate) return err('Title, assignee and due date are required');
       const t = {
         id: uid(), title: p.title, description: p.description || '', priority: p.priority || 'Medium',
@@ -230,9 +229,8 @@ function route(db, req) {
       if (!task) return err('Task not found');
       const isAssignee = task.assignedTo === user.id;
       if (!canManage(user, task) && !isAssignee) return err('Not allowed');
-      const allowed = ['Pending','In Progress','On Hold','Under Review','Revision Required','Completed'];
-      if (!allowed.includes(p.status)) return err('Invalid status');
-      if (isAssignee && !canManage(user, task) && p.status === 'Completed') return err('Only your team head can mark tasks completed');
+      const allowed = ['Pending','In Progress','On Hold','Under Review','Revision Required'];
+      if (!allowed.includes(p.status)) return err('Invalid status — tasks can only be completed via approval');
       task.status = p.status;
       task.updatedISO = now();
       if (p.status === 'Completed') task.completedISO = now();
@@ -258,22 +256,23 @@ function route(db, req) {
     case 'submitTask': {
       const task = db.tasks.find(t => t.id === p.id);
       if (!task) return err('Task not found');
-      if (task.assignedTo !== user.id && !canManage(user, task)) return err('Not allowed');
+      if (task.assignedTo !== user.id) return err('Only the assignee can submit this task');
       closeOpenLogs(db, p.id, user.id);
       task.status = 'Under Review';
       task.submittedISO = now();
       task.updatedISO = now();
-      log(db, p.id, user.id, 'submitted', '');
-      const head = db.users.find(u => u.role === 'head' && u.team === task.team && u.active);
-      if (head) notify(db, head.id, 'review', p.id, user.name + ' submitted for review: ' + task.title);
+      log(db, p.id, user.id, 'submitted', 'sent for approval');
+      // notify ALL heads + admin
+      db.users.filter(u => u.active && (u.role === 'admin' || (u.role === 'head' && u.team === task.team)))
+        .forEach(u => notify(db, u.id, 'review', p.id, user.name + ' submitted for approval: ' + task.title));
       return { ok: true, data: task };
     }
 
     case 'reviewTask': {
       const task = db.tasks.find(t => t.id === p.id);
       if (!task) return err('Task not found');
-      const isOriginalHead = task.forwardedTo && task.forwardedTo === user.id;
-      if (!canManage(user, task) && !isOriginalHead) return err('Only team heads or admin can review');
+      if (user.role === 'member') return err('Only team leads and admins can approve tasks');
+      if (!canManage(user, task)) return err('Only the team lead or admin can approve this task');
       if (p.decision === 'approve') {
         task.status = 'Completed';
         task.completedISO = now();
