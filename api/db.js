@@ -144,6 +144,66 @@ function seedDb() {
   return db;
 }
 
+/* ---------------- Migration (auto-fixes old data on load) ---------------- */
+
+function migrateDb(db) {
+  let changed = false;
+
+  // Ensure all top-level collections exist
+  const collections = ['teams', 'users', 'tasks', 'timelogs', 'comments', 'activity', 'notifications'];
+  collections.forEach(k => { if (!db[k]) { db[k] = []; changed = true; } });
+
+  // Seed teams if missing
+  if (!db.teams.length) {
+    [['Design',0],['Digital Marketing',1],['SEO',2],['Content',3]]
+      .forEach(t => db.teams.push({ id: uid(), name: t[0], color: t[1], createdISO: now() }));
+    changed = true;
+  }
+
+  // Task field defaults (add any missing fields to existing tasks)
+  const taskDefaults = {
+    forwardedTo: '', description: '', priority: 'Medium', startDate: '',
+    estimatedHours: '', project: '', category: 'Other',
+    attachments: '[]', notes: '', checklist: '[]', tags: '[]',
+    submittedISO: '', completedISO: '', updatedISO: ''
+  };
+  db.tasks.forEach(t => {
+    Object.entries(taskDefaults).forEach(([k, v]) => {
+      if (t[k] === undefined || t[k] === null) { t[k] = v; changed = true; }
+    });
+    // Normalise attachments: ensure type field exists
+    try {
+      const atts = JSON.parse(t.attachments || '[]');
+      const fixed = atts.map(a => ({ type: 'link', ...a }));
+      if (JSON.stringify(atts) !== JSON.stringify(fixed)) { t.attachments = JSON.stringify(fixed); changed = true; }
+    } catch (e) { t.attachments = '[]'; changed = true; }
+  });
+
+  // User field defaults
+  const userDefaults = { active: true, mustReset: false, team: '', notes: '' };
+  db.users.forEach(u => {
+    Object.entries(userDefaults).forEach(([k, v]) => {
+      if (u[k] === undefined || u[k] === null) { u[k] = v; changed = true; }
+    });
+    // Normalize active field (could be string 'TRUE' from old Apps Script data)
+    if (typeof u.active === 'string') { u.active = u.active === 'TRUE' || u.active === 'true'; changed = true; }
+    if (typeof u.mustReset === 'string') { u.mustReset = u.mustReset === 'TRUE' || u.mustReset === 'true'; changed = true; }
+  });
+
+  // Timelog field defaults
+  db.timelogs.forEach(l => {
+    if (l.endISO === undefined) { l.endISO = ''; changed = true; }
+    if (l.seconds === undefined) { l.seconds = ''; changed = true; }
+  });
+
+  // Notification field defaults
+  db.notifications.forEach(n => {
+    if (n.read === undefined) { n.read = false; changed = true; }
+  });
+
+  return changed;
+}
+
 /* ---------------- Actions (mutate db in place, return response) ---------------- */
 
 function route(db, req) {
@@ -436,12 +496,15 @@ module.exports = async (req, res) => {
       let seeded = false;
       if (!db) { db = seedDb(); seeded = true; }
 
+      // Auto-migrate: fill in any missing fields from schema updates
+      const migrated = migrateDb(db);
+
       const out = route(db, body);
       const response = out && out.res ? out.res : out;
       const isWrite = !(out && out.write === false) && !READ_ONLY.has(body.action);
 
-      if (seeded || (isWrite && response.ok)) {
-        const saved = await saveDb(db, sha, 'taskdesk: ' + body.action);
+      if (seeded || migrated || (isWrite && response.ok)) {
+        const saved = await saveDb(db, sha, seeded ? 'taskdesk: seed' : migrated ? 'taskdesk: migrate' : 'taskdesk: ' + body.action);
         if (!saved) { await new Promise(r => setTimeout(r, 150 + Math.random() * 250)); continue; } // conflict -> retry on fresh copy
       }
       return res.status(200).json(response);
