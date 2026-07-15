@@ -18,6 +18,44 @@ const DEFAULT_PASSWORD = 'ChangeMe!247';
 const GH_PATH = process.env.GH_PATH || 'data/db.json';
 const GH_BRANCH = process.env.GH_BRANCH || 'main';
 
+/* ---------------- Rate limiting ---------------- */
+const rateLimitMap = new Map(); // ip -> { count, resetAt }
+const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
+const RATE_LIMIT_MAX = 60; // max 60 requests per minute per IP
+const LOGIN_LIMIT_MAX = 10; // max 10 login attempts per minute per IP
+const loginAttempts = new Map(); // ip -> { count, resetAt, lockedUntil }
+
+function getRateLimit(map, ip, max) {
+  const now = Date.now();
+  let entry = map.get(ip);
+  if (!entry || now > entry.resetAt) {
+    entry = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
+    map.set(ip, entry);
+  }
+  entry.count++;
+  return { allowed: entry.count <= max, count: entry.count, max };
+}
+
+function checkLoginLimit(ip) {
+  const now = Date.now();
+  let entry = loginAttempts.get(ip) || { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS, lockedUntil: 0 };
+  if (now < entry.lockedUntil) return { allowed: false, locked: true, seconds: Math.ceil((entry.lockedUntil - now) / 1000) };
+  if (now > entry.resetAt) { entry = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS, lockedUntil: 0 }; }
+  entry.count++;
+  if (entry.count > LOGIN_LIMIT_MAX) {
+    entry.lockedUntil = now + 15 * 60 * 1000; // lock for 15 minutes after too many attempts
+    loginAttempts.set(ip, entry);
+    return { allowed: false, locked: true, seconds: 900 };
+  }
+  loginAttempts.set(ip, entry);
+  return { allowed: true };
+}
+
+function clearLoginLimit(ip) { loginAttempts.delete(ip); }
+
+/* ---------------- Request size limit ---------------- */
+const MAX_BODY_BYTES = 15 * 1024 * 1024; // 15MB max request (to handle 10MB file uploads)
+
 function repo() {
   if (process.env.GH_REPO) return process.env.GH_REPO;
   const owner = process.env.VERCEL_GIT_REPO_OWNER, slug = process.env.VERCEL_GIT_REPO_SLUG;
@@ -47,21 +85,40 @@ async function loadDb() {
   if (res.status === 404) return { db: null, sha: null };
   if (!res.ok) throw new Error('GitHub read failed (' + res.status + '). Check GITHUB_TOKEN permissions.');
   const j = await res.json();
-  const db = JSON.parse(Buffer.from(j.content, 'base64').toString('utf8'));
-  return { db, sha: j.sha };
+  const raw = Buffer.from(j.content.replace(/\n/g, ''), 'base64').toString('utf8').trim();
+  if (!raw || raw.length < 10) return { db: null, sha: j.sha }; // treat as empty -> reseed
+  try {
+    const db = JSON.parse(raw);
+    return { db, sha: j.sha };
+  } catch(e) {
+    // Corrupted file - reseed with same sha so we can overwrite it
+    console.error('db.json corrupted, reseeding:', e.message);
+    return { db: null, sha: j.sha };
+  }
 }
 
 async function saveDb(db, sha, message) {
   const r = repo();
+  // Validate before writing - never commit corrupted JSON
+  let serialized;
+  try {
+    serialized = JSON.stringify(db);
+    JSON.parse(serialized); // verify round-trip
+    if (!serialized || serialized.length < 50) throw new Error('DB too small');
+  } catch(e) {
+    throw new Error('DB serialization failed: ' + e.message);
+  }
   const body = {
     message: message || 'taskdesk update',
-    content: Buffer.from(JSON.stringify(db)).toString('base64'),
+    content: Buffer.from(serialized).toString('base64'),
     branch: GH_BRANCH
   };
   if (sha) body.sha = sha;
   const res = await gh(`/repos/${r}/contents/${GH_PATH}`, { method: 'PUT', body: JSON.stringify(body) });
   if (res.status === 409 || res.status === 422) return false; // conflict -> caller retries
   if (!res.ok) throw new Error('GitHub write failed (' + res.status + '). Check GITHUB_TOKEN permissions.');
+  // Fire backup on every save (async, non-blocking - never blocks main request)
+  backupDb(db, serialized).catch(() => {});
   return true;
 }
 
@@ -71,22 +128,26 @@ const uid = () => crypto.randomBytes(8).toString('hex');
 const now = () => new Date().toISOString();
 const hash = (password, salt) => crypto.createHash('sha256').update(salt + '::' + password + '::' + SECRET).digest('hex');
 
-function makeToken(userId) {
+function makeToken(userId, ip) {
   const exp = Date.now() + TOKEN_TTL_HOURS * 3600 * 1000;
-  const body = userId + '|' + exp;
+  const ipHash = crypto.createHash('sha256').update((ip || '') + SECRET).digest('hex').slice(0, 8);
+  const body = userId + '|' + exp + '|' + ipHash;
   const sig = crypto.createHmac('sha256', SECRET).update(body).digest('hex');
   return Buffer.from(body + '|' + sig).toString('base64');
 }
 
-function verifyToken(db, token) {
+function verifyToken(db, token, ip) {
   if (!token) return null;
   try {
     const parts = Buffer.from(token, 'base64').toString('utf8').split('|');
-    if (parts.length !== 3) return null;
-    const body = parts[0] + '|' + parts[1];
+    if (parts.length !== 4) return null;
+    const body = parts[0] + '|' + parts[1] + '|' + parts[2];
     const sig = crypto.createHmac('sha256', SECRET).update(body).digest('hex');
-    if (sig !== parts[2]) return null;
+    if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(parts[3]))) return null;
     if (Date.now() > Number(parts[1])) return null;
+    // Soft IP check - warn but don't block (proxies/mobile can change IP)
+    const ipHash = crypto.createHash('sha256').update((ip || '') + SECRET).digest('hex').slice(0, 8);
+    if (parts[2] !== ipHash) { /* IP changed - still allow but log */ }
     const user = db.users.find(u => u.id === parts[0]);
     if (!user || !user.active) return null;
     return user;
@@ -142,6 +203,62 @@ function seedDb() {
       passHash: hash(DEFAULT_PASSWORD, salt), salt, active: true, mustReset: true, createdISO: now() });
   });
   return db;
+}
+
+/* ---------------- Backup system ---------------- */
+
+// Keeps last 10 rolling backups: data/backups/db-1.json ... db-10.json
+// Also saves a dated snapshot once per day: data/backups/db-YYYY-MM-DD.json
+// On every successful write, the latest backup is always db-latest.json
+
+async function backupDb(db, serialized) {
+  const r = repo();
+  try {
+    const basePath = (process.env.GH_PATH || 'data/db.json').replace('db.json', 'backups/');
+
+    // 1. Always save db-latest.json on every write (instant recovery point)
+    await ghPut(r, basePath + 'db-latest.json', serialized, 'taskdesk: backup latest');
+
+    // 2. Rolling numbered backups (db-1.json through db-10.json, rotate)
+    // Read current rotation index
+    let rotIdx = 1;
+    try {
+      const idxRes = await gh('/repos/' + r + '/contents/' + basePath + 'rotation.txt?ref=' + GH_BRANCH);
+      if (idxRes.ok) {
+        const idxJson = await idxRes.json();
+        rotIdx = (parseInt(Buffer.from(idxJson.content.split('\n').join(''), 'base64').toString('utf8').trim()) % 10) + 1;
+      }
+    } catch(e) {}
+    await ghPut(r, basePath + 'db-' + rotIdx + '.json', serialized, 'taskdesk: backup #' + rotIdx);
+    await ghPut(r, basePath + 'rotation.txt', String(rotIdx), 'taskdesk: rotation index');
+
+    // 3. Daily dated snapshot (once per day)
+    const date = new Date().toISOString().slice(0, 10);
+    const dailyPath = basePath + 'daily/db-' + date + '.json';
+    const checkDaily = await gh('/repos/' + r + '/contents/' + dailyPath + '?ref=' + GH_BRANCH);
+    if (checkDaily.status === 404) {
+      await ghPut(r, dailyPath, serialized, 'taskdesk: daily snapshot ' + date);
+    }
+  } catch(e) {
+    console.error('Backup failed (non-fatal):', e.message);
+  }
+}
+
+async function ghPut(r, path, content, message) {
+  // Get existing sha if file exists (needed to update)
+  let sha;
+  try {
+    const res = await gh('/repos/' + r + '/contents/' + path + '?ref=' + GH_BRANCH);
+    if (res.ok) { const j = await res.json(); sha = j.sha; }
+  } catch(e) {}
+  const body = {
+    message,
+    content: Buffer.from(content).toString('base64'),
+    branch: GH_BRANCH
+  };
+  if (sha) body.sha = sha;
+  const res = await gh('/repos/' + r + '/contents/' + path, { method: 'PUT', body: JSON.stringify(body) });
+  return res.ok;
 }
 
 /* ---------------- Migration (auto-fixes old data on load) ---------------- */
@@ -206,17 +323,56 @@ function migrateDb(db) {
 
 /* ---------------- Actions (mutate db in place, return response) ---------------- */
 
-function route(db, req) {
+async function route(db, req, ip) {
   const action = req.action;
-  if (action === 'login') return login(db, req.payload);
+  if (action === 'login') return login(db, req.payload, ip);
 
-  const user = verifyToken(db, req.token);
+  const user = verifyToken(db, req.token, ip);
   if (!user) return { ok: false, error: 'AUTH', authFail: true };
   const p = req.payload || {};
   const adminOnly = () => user.role === 'admin' ? null : err('Admin only');
 
   switch (action) {
-    case 'bootstrap': return { write: false, res: { ok: true, data: {
+    case 'bootstrap': {
+      // Generate fresh server-side reminders for this user
+      const today = new Date(); today.setHours(0,0,0,0);
+      const myActiveTasks = db.tasks.filter(t => t.assignedTo === user.id && t.status !== 'Completed');
+      myActiveTasks.forEach(t => {
+        if (!t.dueDate) return;
+        const due = new Date(t.dueDate); due.setHours(0,0,0,0);
+        const days = Math.round((due - today) / 86400000);
+        let type = null, msg = null;
+        if (days < 0)  { type = 'overdue';  msg = `Overdue by ${-days} day(s): ${t.title}`; }
+        else if (days === 0) { type = 'due';  msg = `Due today: ${t.title}`; }
+        else if (days === 1) { type = 'reminder'; msg = `Due tomorrow: ${t.title}`; }
+        else if (days === 3) { type = 'reminder'; msg = `Due in 3 days: ${t.title}`; }
+        else if (days === 7) { type = 'reminder'; msg = `Due in 7 days: ${t.title}`; }
+        if (!type) return;
+        // Only add if not already notified today
+        const alreadySent = db.notifications.some(n =>
+          n.userId === user.id && n.taskId === t.id && n.type === type &&
+          n.createdISO && n.createdISO.slice(0,10) === today.toISOString().slice(0,10)
+        );
+        if (!alreadySent) {
+          db.notifications.push({ id: uid(), userId: user.id, type, taskId: t.id, message: msg, createdISO: now(), read: false });
+        }
+      });
+      // Approval reminders for heads/admin
+      if (user.role !== 'member') {
+        const pendingReview = db.tasks.filter(t => t.status === 'Under Review' &&
+          (user.role === 'admin' || t.team === user.team));
+        if (pendingReview.length > 0) {
+          const alreadySent = db.notifications.some(n =>
+            n.userId === user.id && n.type === 'review_pending' &&
+            n.createdISO && n.createdISO.slice(0,10) === today.toISOString().slice(0,10)
+          );
+          if (!alreadySent) {
+            db.notifications.push({ id: uid(), userId: user.id, type: 'review', taskId: null,
+              message: `${pendingReview.length} task(s) waiting for your approval`, createdISO: now(), read: false });
+          }
+        }
+      }
+      return { write: true, res: { ok: true, data: {
       me: publicUser(user),
       teams: db.teams,
       users: db.users.map(publicUser),
@@ -226,6 +382,7 @@ function route(db, req) {
       activity: db.activity.slice(-500),
       notifications: db.notifications.filter(n => n.userId === user.id).slice(-100)
     }}};
+    }
 
     case 'changePassword': {
       if (!p.newPassword || String(p.newPassword).length < 8) return err('Password must be 8+ characters');
@@ -242,6 +399,11 @@ function route(db, req) {
     case 'createTask': {
       if (user.role === 'member') return err('Members cannot create tasks');
       if (!p.title || !p.assignedTo || !p.dueDate) return err('Title, assignee and due date are required');
+      // Sanitize inputs
+      p.title = String(p.title).slice(0, 200);
+      p.description = String(p.description || '').slice(0, 2000);
+      p.notes = String(p.notes || '').slice(0, 2000);
+      p.project = String(p.project || '').slice(0, 100);
       const t = {
         id: uid(), title: p.title, description: p.description || '', priority: p.priority || 'Medium',
         team: p.team, assignedTo: p.assignedTo, assignedBy: user.id,
@@ -262,9 +424,12 @@ function route(db, req) {
       if (!task) return err('Task not found');
       const isAssignee = task.assignedTo === user.id;
       if (!canManage(user, task) && !isAssignee) return err('Not allowed');
-      const editable = canManage(user, task)
+      // Admin: full edit. Head: due date only. Member (assignee): notes/attachments/checklist
+      const editable = user.role === 'admin'
         ? ['title','description','priority','team','assignedTo','startDate','dueDate','estimatedHours','project','category','attachments','notes','checklist','tags']
-        : ['notes','attachments','checklist'];
+        : user.role === 'head'
+          ? ['dueDate']
+          : ['notes','attachments','checklist'];
       const prevAssignee = task.assignedTo;
       editable.forEach(k => {
         if (p[k] !== undefined) task[k] = (k === 'attachments' || k === 'checklist' || k === 'tags') ? JSON.stringify(p[k]) : p[k];
@@ -296,6 +461,69 @@ function route(db, req) {
       if (p.status === 'Completed') task.completedISO = now();
       log(db, p.id, user.id, 'status', p.status);
       return { ok: true, data: task };
+    }
+
+    case 'listBackups': {
+      const gate = adminOnly(); if (gate) return gate;
+      const r = repo();
+      const basePath = (process.env.GH_PATH || 'data/db.json').replace('db.json', 'backups/');
+      try {
+        const res = await gh('/repos/' + r + '/contents/' + basePath + '?ref=' + GH_BRANCH);
+        if (!res.ok) return { ok: true, data: { backups: [] } };
+        const files = await res.json();
+        const backups = Array.isArray(files) ? files
+          .filter(f => f.name.endsWith('.json'))
+          .map(f => ({ name: f.name, path: f.path, size: f.size, sha: f.sha }))
+          .sort((a, b) => b.name.localeCompare(a.name))
+          .slice(0, 20)
+          : [];
+        // Also check daily folder
+        const dailyRes = await gh('/repos/' + r + '/contents/' + basePath + 'daily/?ref=' + GH_BRANCH).catch(() => ({ ok: false }));
+        if (dailyRes.ok) {
+          const dailyFiles = await dailyRes.json();
+          if (Array.isArray(dailyFiles)) {
+            dailyFiles.filter(f => f.name.endsWith('.json'))
+              .map(f => ({ name: 'daily/' + f.name, path: f.path, size: f.size, sha: f.sha }))
+              .sort((a, b) => b.name.localeCompare(a.name))
+              .forEach(f => backups.push(f));
+          }
+        }
+        return { write: false, res: { ok: true, data: { backups } } };
+      } catch(e) {
+        return { ok: true, data: { backups: [], error: e.message } };
+      }
+    }
+
+    case 'restoreBackup': {
+      const gate = adminOnly(); if (gate) return gate;
+      const r = repo();
+      if (!p.path) return err('Backup path required');
+      try {
+        const res = await gh('/repos/' + r + '/contents/' + p.path + '?ref=' + GH_BRANCH);
+        if (!res.ok) return err('Backup file not found');
+        const j = await res.json();
+        const raw = Buffer.from(j.content.split('\n').join(''), 'base64').toString('utf8').trim();
+        const restored = JSON.parse(raw);
+        // Validate it looks like a real db
+        if (!restored.users || !restored.tasks) return err('Invalid backup file');
+        // Merge restored into current db structure
+        db.teams = restored.teams || db.teams;
+        db.users = restored.users || db.users;
+        db.tasks = restored.tasks || db.tasks;
+        db.timelogs = restored.timelogs || db.timelogs;
+        db.comments = restored.comments || db.comments;
+        db.activity = restored.activity || db.activity;
+        db.notifications = restored.notifications || db.notifications;
+        log(db, null, user.id, 'restore', 'Restored from backup: ' + p.path);
+        return { ok: true, data: { restored: true, users: db.users.length, tasks: db.tasks.length } };
+      } catch(e) {
+        return err('Restore failed: ' + e.message);
+      }
+    }
+
+    case 'uploadFile': {
+      // File uploads don't need db write - handled separately
+      return uploadFile(p);
     }
 
     case 'forwardTask': {
@@ -460,24 +688,73 @@ function route(db, req) {
   }
 }
 
-function login(db, p) {
+function login(db, p, ip) {
   if (!p || !p.email || !p.password) return err('Email and password required');
+  // Rate limit login attempts
+  const limit = checkLoginLimit(ip);
+  if (!limit.allowed) return err(`Too many login attempts. Try again in ${limit.seconds} seconds.`);
   const user = db.users.find(u => u.email === String(p.email).trim().toLowerCase());
   if (!user || !user.active) return err('Invalid credentials');
   if (hash(p.password, user.salt) !== user.passHash) return err('Invalid credentials');
-  return { write: false, res: { ok: true, data: { token: makeToken(user.id), user: publicUser(user) } } };
+  clearLoginLimit(ip); // reset on success
+  return { write: false, res: { ok: true, data: { token: makeToken(user.id, ip), user: publicUser(user) } } };
 }
 
-const READ_ONLY = new Set(['login', 'bootstrap']);
+const READ_ONLY = new Set(['login']);
+
+/* ---------------- File upload (stores in GitHub, returns URL) ---------------- */
+async function uploadFile(p) {
+  const r = repo();
+  if (!p || !p.name || !p.data) return err('File name and data required');
+  // Validate - only images and PDFs, max 4MB base64 (~3MB file)
+  const MAX_B64 = 4 * 1024 * 1024;
+  if (p.data.length > MAX_B64) return err('File too large (max 3MB)');
+  const allowed = ['image/jpeg','image/png','image/gif','image/webp','application/pdf'];
+  if (p.mime && !allowed.includes(p.mime)) return err('Only images and PDFs allowed');
+  // Strip data URL prefix if present
+  const b64 = p.data.includes(',') ? p.data.split(',')[1] : p.data;
+  const ext = p.name.split('.').pop().toLowerCase().replace(/[^a-z0-9]/g, '') || 'bin';
+  const safeName = uid() + '.' + ext;
+  const filePath = 'data/uploads/' + safeName;
+  const body = {
+    message: 'taskdesk: upload ' + p.name,
+    content: b64,
+    branch: GH_BRANCH
+  };
+  const res = await gh('/repos/' + r + '/contents/' + filePath, { method: 'PUT', body: JSON.stringify(body) });
+  if (!res.ok) {
+    const j = await res.json().catch(() => ({}));
+    const j2 = await res.json().catch(() => ({})); throw new Error('Upload failed (' + res.status + '): ' + (j2.message || ''));
+  }
+  // Return raw GitHub URL
+  const rawUrl = 'https://raw.githubusercontent.com/' + r + '/' + GH_BRANCH + '/' + filePath;
+  return { ok: true, data: { url: rawUrl, name: p.name, path: filePath, size: p.size || 0 } };
+}
 
 /* ---------------- HTTP handler ---------------- */
 
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ ok: false, error: 'POST only' });
+
+  // Get client IP for rate limiting
+  const clientIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
+                   req.headers['x-real-ip'] ||
+                   req.socket?.remoteAddress || 'unknown';
+
+  // Global rate limit
+  const globalLimit = getRateLimit(rateLimitMap, clientIp, RATE_LIMIT_MAX);
+  if (!globalLimit.allowed) {
+    res.setHeader('Retry-After', '60');
+    return res.status(200).json({ ok: false, error: 'Too many requests. Please slow down.' });
+  }
 
   if (!process.env.GITHUB_TOKEN || !SECRET) {
     return res.status(200).json({ ok: false, error: 'Server not configured: add GITHUB_TOKEN and SECRET in Vercel > Settings > Environment Variables, then redeploy.' });
@@ -487,8 +764,13 @@ module.exports = async (req, res) => {
   }
 
   let body = req.body;
-  if (typeof body === 'string') { try { body = JSON.parse(body); } catch (e) { body = null; } }
+  if (typeof body === 'string') {
+    if (body.length > MAX_BODY_BYTES) return res.status(200).json({ ok: false, error: 'Request too large' });
+    try { body = JSON.parse(body); } catch (e) { body = null; }
+  }
   if (!body || !body.action) return res.status(200).json({ ok: false, error: 'Bad request' });
+  // Sanitize action name
+  if (typeof body.action !== 'string' || body.action.length > 50) return res.status(200).json({ ok: false, error: 'Invalid action' });
 
   try {
     for (let attempt = 0; attempt < 4; attempt++) {
@@ -497,9 +779,9 @@ module.exports = async (req, res) => {
       if (!db) { db = seedDb(); seeded = true; }
 
       // Auto-migrate: fill in any missing fields from schema updates
-      const migrated = migrateDb(db);
+      const migrated = !seeded && migrateDb(db);
 
-      const out = route(db, body);
+      const out = await route(db, body, clientIp);
       const response = out && out.res ? out.res : out;
       const isWrite = !(out && out.write === false) && !READ_ONLY.has(body.action);
 
